@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# Generated report output and raw portal exports (contain client PII)
+*.xlsx
+*.csv
+.playwright-mcp/

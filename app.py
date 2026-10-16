@@ -1,14 +1,12 @@
-import asyncio
 import os
-import zipfile
 from pathlib import Path
 
 import pandas as pd
+import pymysql
 import pythoncom
 import win32com.client as win32
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
 XL_DATABASE = 1
 XL_ROW_FIELD = 1
@@ -22,18 +20,65 @@ ROW_HEIGHT = 20
 
 load_dotenv()
 
-LOGIN_URL = "https://mis.authbridge.com/export_query/login.php"
-USERNAME = os.getenv("MIS_USERNAME")
-PASSWORD = os.getenv("MIS_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-HOST = "Bridge Live"
-DATABASE = "Bridge Live"
-DATA_TIME_SLAB = "Client Specific Tracker"
-QUERY = "Persistent Systems Limited Cleint Code-7084"
-
-DATA_TIME_SLAB_2 = "Tracker - Query"
-QUERY_2 = "Client Wise All Cases - Bridge"
+CLIENT_ID = 472826
 CLIENT_CODE = "7084"
+
+# Persistent Systems Limited Cleint Code-7084 (main tracker data). The literal
+# 'Insufficiency_Raised' placeholder column from the portal query is omitted: the portal's
+# CSV export collapsed it into the real subquery column of the same name.
+MAIN_QUERY = """
+SELECT
+    ecf.case_flex_field1 AS 'EMP_Code',
+    CONCAT(first_name,' ',middle_name,' ',last_name) AS 'Name',
+    case_ars_no AS 'Vendor_ID',
+    received_date AS 'IN_Date',
+    `fn_case_status`(case_status) AS 'Overall_Case_status',
+    DATE(`fn_latest_ir_date`(ecm.case_id)) AS 'CBC_Report_Date',
+    IF(fn_last_ir_severity(ecm.case_id) COLLATE utf8mb3_unicode_ci = 'Attention Required' COLLATE utf8mb3_unicode_ci, 'Amber',
+       IF(fn_last_ir_severity(ecm.case_id) COLLATE utf8mb3_unicode_ci = 'Insufficient' COLLATE utf8mb3_unicode_ci, 'Amber',
+          IF(fn_last_ir_severity(ecm.case_id) COLLATE utf8mb3_unicode_ci = 'No Response Received' COLLATE utf8mb3_unicode_ci, 'Green',
+             fn_last_ir_severity(ecm.case_id)
+          )
+       )
+    ) AS 'CBC Report Color Code',
+    DATE(`fn_fr_date`(ecm.case_id)) AS 'Final Report Date',
+    `fn_fr_severity`(ecm.case_id) AS 'Final Report Color Code',
+    fn_latest_report_date(ecm.case_id) AS 'Latest_Report_Sent',
+    fn_latest_report_severity(ecm.case_id) AS 'Latest_Report_Severity',
+    (SELECT GROUP_CONCAT(CONCAT(check_name,'->',fn_check_status(check_status),'->',insuff_remarks))
+       FROM ec_case_checks ecc WHERE ecm.case_id=ecc.case_id AND check_status=3) AS 'Insufficiency_Raised',
+    (SELECT GROUP_CONCAT(check_name)
+       FROM ec_case_checks ecc WHERE ecm.case_id=ecc.case_id AND check_status NOT IN (8,9,10,11)) AS 'Pending_Checks',
+    (SELECT GROUP_CONCAT(check_name)
+       FROM ec_case_checks ecc WHERE ecm.case_id=ecc.case_id AND check_status <> 9) AS 'Inititated_Checks'
+FROM ec_case_master ecm
+LEFT JOIN ec_case_fields ecf ON ecm.case_id=ecf.case_id
+LEFT JOIN ec_case_candidates ec ON ecm.candidate_id=ec.candidate_id
+WHERE ecm.client_id=%s AND
+    CONCAT(first_name,' ',middle_name,' ',last_name) NOT LIKE '%%Test%%' AND
+    CONCAT(first_name,' ',middle_name,' ',last_name) NOT LIKE '%%Dummy%%'
+    AND case_status NOT IN (8,14)
+"""
+
+# Client Wise All Cases - Bridge, trimmed to the two columns used for the Date of Joining
+# lookup (case_flex_field2 holds the raw joining date); joins and filters are unchanged.
+TRACKER_QUERY = """
+SELECT case_ars_no, ecf3.case_flex_field2
+FROM ec_case_master ecm
+INNER JOIN ec_master_company emc ON ecm.client_id=emc.company_id
+INNER JOIN ec_client ec ON emc.company_id=ec.client_id
+LEFT JOIN ec_client_process ecp ON ecm.process_id=ecp.process_id
+LEFT JOIN ec_master_company_locations emcl ON ecm.client_office_id=emcl.office_id
+INNER JOIN ec_case_candidates ecc1 ON ecc1.candidate_id=ecm.candidate_id
+LEFT JOIN ec_case_fields ecf3 ON ecm.case_id=ecf3.case_id
+WHERE ec.client_external_id IN (%s) AND first_name <> 'dummy'
+"""
 
 DOWNLOAD_DIR = Path(__file__).resolve().parent
 REPORT_PATH = DOWNLOAD_DIR / "Persistent MIS Tracker Report.xlsx"
@@ -58,44 +103,41 @@ COLUMN_NAMES = [
 EXCLUDED_STATUSES = ["Duplicity", "Closed by Authbridge"]
 
 
-def login(page):
-    page.goto(LOGIN_URL)
-    page.fill('input[name="username"]', USERNAME)
-    page.fill('input[name="password"]', PASSWORD)
-    page.click('input[name="login"]')
-    page.wait_for_load_state("networkidle")
+def run_query(sql, params):
+    connection = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        charset="utf8",
+    )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            columns = [col[0] for col in cursor.description]
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+    return columns, rows
 
 
-def select_report(page):
-    page.select_option('select[name="hostname"]', HOST)
-    page.select_option('select[name="database"]', DATABASE)
-    page.select_option('select[name="access_time"]', DATA_TIME_SLAB)
-    page.select_option('select[name="csv_query"]', QUERY)
+def fetch_main_data():
+    _, rows = run_query(MAIN_QUERY, (CLIENT_ID,))
+    # Stringify the same way the portal's CSV export did (ISO dates, blanks for NULL) so the
+    # Data Tab cell types match earlier reports.
+    return pd.DataFrame(
+        [["" if v is None else str(v) for v in row] for row in rows],
+        columns=COLUMN_NAMES[:14],
+    )
 
 
-def select_tracker_report(page):
-    page.select_option('select[name="hostname"]', HOST)
-    page.select_option('select[name="database"]', DATABASE)
-    page.select_option('select[name="access_time"]', DATA_TIME_SLAB_2)
-    page.select_option('select[name="csv_query"]', QUERY_2)
-    page.fill('input[name="client1"]', CLIENT_CODE)
-
-
-def export_report(page):
-    with page.expect_download() as download_info:
-        page.click("#run_query")
-    download = download_info.value
-    target_path = DOWNLOAD_DIR / download.suggested_filename
-    download.save_as(target_path)
-    return target_path
-
-
-def unzip_report(zip_path):
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(DOWNLOAD_DIR)
-        csv_name = zf.namelist()[0]
-    zip_path.unlink()
-    return DOWNLOAD_DIR / csv_name
+def fetch_tracker_data():
+    columns, rows = run_query(TRACKER_QUERY, (CLIENT_CODE,))
+    return pd.DataFrame(
+        [["" if v is None else str(v) for v in row] for row in rows],
+        columns=["case_ars_no", "case_flex_field2"],
+    )
 
 
 def parse_doj(value):
@@ -108,13 +150,7 @@ def parse_doj(value):
         return None
 
 
-def build_doj_map(tracker_csv_path):
-    df = pd.read_csv(
-        tracker_csv_path,
-        usecols=["case_ars_no", "case_flex_field2"],
-        dtype=str,
-        keep_default_na=False,
-    )
+def build_doj_map(df):
     doj_map = {}
     for vendor_id, raw_value in zip(df["case_ars_no"], df["case_flex_field2"]):
         vendor_id = vendor_id.strip()
@@ -123,7 +159,6 @@ def build_doj_map(tracker_csv_path):
         parsed = parse_doj(raw_value)
         if parsed is not None:
             doj_map[vendor_id] = parsed
-    tracker_csv_path.unlink()
     return doj_map
 
 
@@ -136,10 +171,10 @@ def normalize_emp_code(value):
     return text
 
 
-def build_report_workbook(csv_path, doj_map):
-    df = pd.read_csv(csv_path, dtype={0: str})
-    df = df.iloc[:, :14]
+def build_report_workbook(df, doj_map):
+    df = df.copy()
     df.columns = COLUMN_NAMES
+    df = df.mask(df == "")
     df["Emp Code"] = df["Emp Code"].map(normalize_emp_code)
     df["Date of joining"] = df["Vendor ID"].astype(str).str.strip().map(doj_map)
     df = df[~df["Overall case status"].isin(EXCLUDED_STATUSES)]
@@ -227,41 +262,16 @@ def build_pivot_summary(report_path):
         pythoncom.CoUninitialize()
 
 
-def generate_report(headless=False):
-    previous_policy = asyncio.get_event_loop_policy()
-    if os.name == "nt":
-        # Streamlit's Tornado server forces WindowsSelectorEventLoopPolicy process-wide,
-        # but Playwright's sync API needs Proactor to launch the browser subprocess.
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    try:
-        with sync_playwright() as p:
-            # Playwright's bundled Chromium binary gets its outbound HTTPS blocked by
-            # endpoint security software on this machine; the system-installed Edge
-            # (already trusted) works fine.
-            browser = p.chromium.launch(headless=headless, channel="msedge")
-            page = browser.new_page()
-            login(page)
-
-            select_report(page)
-            zip_path = export_report(page)
-
-            select_tracker_report(page)
-            tracker_zip_path = export_report(page)
-
-            browser.close()
-    finally:
-        asyncio.set_event_loop_policy(previous_policy)
-
-    csv_path = unzip_report(zip_path)
-    tracker_csv_path = unzip_report(tracker_zip_path)
-    doj_map = build_doj_map(tracker_csv_path)
-    report_path = build_report_workbook(csv_path, doj_map)
+def generate_report():
+    main_df = fetch_main_data()
+    doj_map = build_doj_map(fetch_tracker_data())
+    report_path = build_report_workbook(main_df, doj_map)
     build_pivot_summary(report_path)
     return report_path
 
 
 def main():
-    report_path = generate_report(headless=False)
+    report_path = generate_report()
     print(f"Report saved to: {report_path}")
 
 

@@ -8,12 +8,12 @@ from app import generate_report
 st.set_page_config(page_title="Persistent MIS Tracker Report", page_icon="📊", layout="wide")
 
 st.title("Persistent MIS Tracker Report")
-st.caption("Pulls the latest Persistent Systems Limited tracker data from the AuthBridge MIS Query Browser and builds the report workbook.")
+st.caption("Pulls the latest Persistent Systems Limited tracker data directly from the AuthBridge database and builds the report workbook.")
 
 if st.button("Generate Report", type="primary"):
-    with st.spinner("Logging in and pulling data from mis.authbridge.com..."):
+    with st.spinner("Pulling data from the database..."):
         try:
-            report_path = generate_report(headless=True)
+            report_path = generate_report()
         except Exception as exc:
             st.error("Report generation failed:")
             st.exception(exc)
